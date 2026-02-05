@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Clinical Trials Map</title>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#eef7ff', 100: '#d9edff', 200: '#bce0ff', 300: '#8ecdff', 400: '#59b0ff', 500: '#3390ff', 600: '#1a6ff5', 700: '#1459e1', 800: '#1748b6', 900: '#193f8f', 950: '#142857' }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Leaflet CSS/JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet MarkerCluster -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <!-- React -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    #map { height: 100%; width: 100%; }
+    .leaflet-popup-content { max-height: 260px; overflow-y: auto; }
+    .custom-cluster {
+      background: rgba(26, 111, 245, 0.25);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .custom-cluster div {
+      background: rgba(26, 111, 245, 0.85);
+      border-radius: 50%; color: #fff; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; flex-shrink: 0; margin-top: 5px; }
+    .status-recruiting { background-color: #22c55e; }
+    .status-completed { background-color: #3b82f6; }
+    .status-active { background-color: #f59e0b; }
+    .status-other { background-color: #9ca3af; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+    .skeleton { animation: pulse 1.5s ease-in-out infinite; background: #e2e8f0; border-radius: 6px; }
+  </style>
+</head>
+<body class="bg-gray-50 h-screen flex flex-col overflow-hidden">
+  <div id="root" class="flex flex-col h-full"></div>
+
+  <script type="text/babel" data-type="module">
+    const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+    /* ------------------------------------------------------------------ */
+    /*  Constants                                                          */
+    /* ------------------------------------------------------------------ */
+    const API_BASE = 'https://clinicaltrials.gov/api/v2/studies';
+    const PAGE_SIZE = 50;
+
+    const STATUS_COLORS = {
+      RECRUITING:             '#22c55e',
+      ACTIVE_NOT_RECRUITING:  '#f59e0b',
+      COMPLETED:              '#3b82f6',
+      ENROLLING_BY_INVITATION:'#8b5cf6',
+      SUSPENDED:              '#ef4444',
+      TERMINATED:             '#dc2626',
+      WITHDRAWN:              '#9ca3af',
+      NOT_YET_RECRUITING:     '#06b6d4',
+      UNKNOWN:                '#6b7280',
+    };
+
+    const STATUS_LABELS = {
+      RECRUITING:             'Recruiting',
+      ACTIVE_NOT_RECRUITING:  'Active, not recruiting',
+      COMPLETED:              'Completed',
+      ENROLLING_BY_INVITATION:'Enrolling by invitation',
+      SUSPENDED:              'Suspended',
+      TERMINATED:             'Terminated',
+      WITHDRAWN:              'Withdrawn',
+      NOT_YET_RECRUITING:     'Not yet recruiting',
+      UNKNOWN:                'Unknown',
+    };
+
+    const PHASE_OPTIONS = ['EARLY_PHASE1','PHASE1','PHASE2','PHASE3','PHASE4','NA'];
+    const PHASE_LABELS  = { EARLY_PHASE1:'Early Phase 1', PHASE1:'Phase 1', PHASE2:'Phase 2', PHASE3:'Phase 3', PHASE4:'Phase 4', NA:'N/A' };
+
+    /* ------------------------------------------------------------------ */
+    /*  API helper                                                         */
+    /* ------------------------------------------------------------------ */
+    async function fetchStudies(query, filters = {}, pageToken = null) {
+      const params = new URLSearchParams();
+      if (query) params.set('query.cond', query);
+      params.set('pageSize', PAGE_SIZE);
+      params.set('fields', 'NCTId|BriefTitle|OverallStatus|Phase|StartDate|LeadSponsorName|BriefSummary|Condition|LocationCity|LocationState|LocationCountry|LocationFacility|LocationGeoPoint');
+      if (filters.status?.length)  params.set('filter.overallStatus', filters.status.join('|'));
+      if (filters.phase?.length)   params.set('query.phase', filters.phase.join(','));
+      if (pageToken) params.set('pageToken', pageToken);
+      params.set('countTotal', 'true');
+
+      const res = await fetch(`${API_BASE}?${params}`);
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      return res.json();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Extract locations with coordinates from a study                    */
+    /* ------------------------------------------------------------------ */
+    function extractLocations(study) {
+      const proto = study.protocolSection || {};
+      const locs  = proto.contactsLocationsModule?.locations || [];
+      return locs
+        .filter(l => l.geoPoint?.lat && l.geoPoint?.lon)
+        .map(l => ({
+          lat: l.geoPoint.lat,
+          lon: l.geoPoint.lon,
+          facility: l.facility || '',
+          city: l.city || '',
+          state: l.state || '',
+          country: l.country || '',
+        }));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Helpers                                                            */
+    /* ------------------------------------------------------------------ */
+    function statusClass(status) {
+      if (status === 'RECRUITING') return 'status-recruiting';
+      if (status === 'COMPLETED') return 'status-completed';
+      if (status?.startsWith('ACTIVE')) return 'status-active';
+      return 'status-other';
+    }
+
+    function statusColor(status) {
+      return STATUS_COLORS[status] || '#6b7280';
+    }
+
+    function formatStatus(s) {
+      return STATUS_LABELS[s] || s?.replace(/_/g, ' ') || 'Unknown';
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Components                                                         */
+    /* ------------------------------------------------------------------ */
+
+    /* ----- Search Bar ------------------------------------------------- */
+    function SearchBar({ onSearch, loading }) {
+      const [value, setValue] = useState('');
+      const submit = (e) => { e.preventDefault(); onSearch(value.trim()); };
+
+      return (
+        <form onSubmit={submit} className="flex gap-2 w-full">
+          <div className="relative flex-1">
+            <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+            <input
+              type="text"
+              value={value}
+              onChange={e => setValue(e.target.value)}
+              placeholder="Search condition or disease (e.g. diabetes, lung cancer)..."
+              className="w-full pl-10 pr-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none text-sm"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={loading}
+            className="px-5 py-2.5 bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-50 text-sm font-medium transition-colors flex items-center gap-2"
+          >
+            {loading && <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/></svg>}
+            Search
+          </button>
+        </form>
+      );
+    }
+
+    /* ----- Filters ----------------------------------------------------- */
+    function Filters({ filters, setFilters }) {
+      const [open, setOpen] = useState(false);
+
+      const toggleArr = (key, val) => {
+        setFilters(prev => {
+          const arr = prev[key] || [];
+          return { ...prev, [key]: arr.includes(val) ? arr.filter(v => v !== val) : [...arr, val] };
+        });
+      };
+
+      const activeCount = (filters.status?.length || 0) + (filters.phase?.length || 0);
+
+      return (
+        <div className="relative">
+          <button onClick={() => setOpen(o => !o)} className="flex items-center gap-1.5 px-3 py-2.5 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm font-medium text-gray-700 transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+            Filters
+            {activeCount > 0 && <span className="ml-1 px-1.5 py-0.5 text-xs bg-brand-100 text-brand-700 rounded-full">{activeCount}</span>}
+          </button>
+
+          {open && (
+            <div className="absolute top-full left-0 mt-2 bg-white border border-gray-200 rounded-xl shadow-lg z-[1000] p-4 w-72">
+              <div className="mb-3">
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Status</h4>
+                <div className="flex flex-wrap gap-1.5">
+                  {Object.keys(STATUS_LABELS).map(s => (
+                    <button key={s} onClick={() => toggleArr('status', s)}
+                      className={`px-2 py-1 text-xs rounded-full border transition-colors ${filters.status?.includes(s) ? 'bg-brand-50 border-brand-300 text-brand-700' : 'border-gray-200 text-gray-600 hover:bg-gray-50'}`}>
+                      <span className="inline-block w-2 h-2 rounded-full mr-1" style={{background: statusColor(s)}}></span>
+                      {STATUS_LABELS[s]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Phase</h4>
+                <div className="flex flex-wrap gap-1.5">
+                  {PHASE_OPTIONS.map(p => (
+                    <button key={p} onClick={() => toggleArr('phase', p)}
+                      className={`px-2 py-1 text-xs rounded-full border transition-colors ${filters.phase?.includes(p) ? 'bg-brand-50 border-brand-300 text-brand-700' : 'border-gray-200 text-gray-600 hover:bg-gray-50'}`}>
+                      {PHASE_LABELS[p]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="mt-3 pt-3 border-t flex justify-end">
+                <button onClick={() => { setFilters({ status: [], phase: [] }); setOpen(false); }} className="text-xs text-gray-500 hover:text-gray-700">Clear all</button>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ----- Trial Card -------------------------------------------------- */
+    function TrialCard({ study, isSelected, onClick }) {
+      const proto  = study.protocolSection || {};
+      const id     = proto.identificationModule;
+      const status = proto.statusModule;
+      const design = proto.designModule;
+      const sponsor = proto.sponsorCollaboratorsModule;
+
+      const nctId   = id?.nctId || '';
+      const title   = id?.briefTitle || 'Untitled';
+      const overall = status?.overallStatus || 'UNKNOWN';
+      const phases  = design?.phases || [];
+      const lead    = sponsor?.leadSponsor?.name || '';
+      const locs    = extractLocations(study);
+
+      return (
+        <div
+          onClick={onClick}
+          className={`p-3 border rounded-lg cursor-pointer transition-all hover:shadow-md ${isSelected ? 'border-brand-500 bg-brand-50 shadow-md' : 'border-gray-200 bg-white hover:border-gray-300'}`}
+        >
+          <div className="flex items-start gap-1.5 mb-1.5">
+            <span className={`status-dot mt-1.5 ${statusClass(overall)}`}></span>
+            <h3 className="text-sm font-medium text-gray-900 leading-snug line-clamp-2">{title}</h3>
+          </div>
+          <div className="ml-3.5 space-y-1">
+            <p className="text-xs text-gray-500">{nctId}</p>
+            <div className="flex flex-wrap gap-1.5">
+              <span className="px-1.5 py-0.5 text-xs rounded bg-gray-100 text-gray-600">{formatStatus(overall)}</span>
+              {phases.map(p => <span key={p} className="px-1.5 py-0.5 text-xs rounded bg-blue-50 text-blue-700">{p.replace('_', ' ')}</span>)}
+            </div>
+            {lead && <p className="text-xs text-gray-500 truncate">{lead}</p>}
+            {locs.length > 0 && <p className="text-xs text-gray-400">{locs.length} location{locs.length > 1 ? 's' : ''}</p>}
+          </div>
+        </div>
+      );
+    }
+
+    /* ----- Study Detail Panel ----------------------------------------- */
+    function StudyDetail({ study, onClose }) {
+      if (!study) return null;
+      const proto   = study.protocolSection || {};
+      const id      = proto.identificationModule;
+      const status  = proto.statusModule;
+      const desc    = proto.descriptionModule;
+      const design  = proto.designModule;
+      const sponsor = proto.sponsorCollaboratorsModule;
+      const conds   = proto.conditionsModule;
+
+      return (
+        <div className="absolute inset-0 bg-white z-10 flex flex-col">
+          <div className="flex items-center justify-between p-4 border-b">
+            <h2 className="font-semibold text-gray-900 text-sm">Study Details</h2>
+            <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded-lg">
+              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div>
+              <span className={`inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full`} style={{background: statusColor(status?.overallStatus) + '20', color: statusColor(status?.overallStatus)}}>
+                {formatStatus(status?.overallStatus)}
+              </span>
+            </div>
+            <h3 className="text-base font-semibold text-gray-900">{id?.briefTitle}</h3>
+            <a href={`https://clinicaltrials.gov/study/${id?.nctId}`} target="_blank" rel="noopener noreferrer" className="text-xs text-brand-600 hover:underline">{id?.nctId} &rarr; ClinicalTrials.gov</a>
+
+            {conds?.conditions?.length > 0 && (
+              <div>
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Conditions</h4>
+                <div className="flex flex-wrap gap-1">{conds.conditions.map(c => <span key={c} className="px-2 py-0.5 text-xs bg-amber-50 text-amber-700 rounded">{c}</span>)}</div>
+              </div>
+            )}
+
+            {desc?.briefSummary && (
+              <div>
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Summary</h4>
+                <p className="text-sm text-gray-700 leading-relaxed">{desc.briefSummary}</p>
+              </div>
+            )}
+
+            {design?.phases?.length > 0 && (
+              <div>
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Phase</h4>
+                <p className="text-sm text-gray-700">{design.phases.join(', ').replace(/_/g, ' ')}</p>
+              </div>
+            )}
+
+            {sponsor?.leadSponsor?.name && (
+              <div>
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Sponsor</h4>
+                <p className="text-sm text-gray-700">{sponsor.leadSponsor.name}</p>
+              </div>
+            )}
+
+            <div>
+              <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Locations</h4>
+              {extractLocations(study).length === 0
+                ? <p className="text-sm text-gray-400 italic">No geolocated sites</p>
+                : <ul className="space-y-1">{extractLocations(study).map((l, i) => (
+                    <li key={i} className="text-sm text-gray-700">{[l.facility, l.city, l.state, l.country].filter(Boolean).join(', ')}</li>
+                  ))}</ul>
+              }
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ----- Skeleton Loader -------------------------------------------- */
+    function SkeletonCards() {
+      return Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="p-3 border border-gray-200 rounded-lg space-y-2">
+          <div className="skeleton h-4 w-3/4"></div>
+          <div className="skeleton h-3 w-1/3"></div>
+          <div className="skeleton h-3 w-1/2"></div>
+        </div>
+      ));
+    }
+
+    /* ----- Map Component ---------------------------------------------- */
+    function MapView({ studies, selectedId, onSelect }) {
+      const mapRef     = useRef(null);
+      const mapInst    = useRef(null);
+      const clusterRef = useRef(null);
+      const markersRef = useRef({});
+
+      // Init map
+      useEffect(() => {
+        if (mapInst.current) return;
+        mapInst.current = L.map(mapRef.current, { zoomControl: false }).setView([20, 0], 2);
+        L.control.zoom({ position: 'topright' }).addTo(mapInst.current);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+          attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
+          maxZoom: 19,
+        }).addTo(mapInst.current);
+
+        clusterRef.current = L.markerClusterGroup({
+          maxClusterRadius: 45,
+          iconCreateFunction: (cluster) => {
+            const count = cluster.getChildCount();
+            const size = count < 20 ? 36 : count < 100 ? 44 : 52;
+            return L.divIcon({
+              html: `<div style="width:${size - 8}px;height:${size - 8}px;font-size:${size < 44 ? 12 : 14}px">${count}</div>`,
+              className: 'custom-cluster',
+              iconSize: [size, size],
+            });
+          }
+        });
+        mapInst.current.addLayer(clusterRef.current);
+
+        return () => { mapInst.current.remove(); mapInst.current = null; };
+      }, []);
+
+      // Update markers
+      useEffect(() => {
+        if (!clusterRef.current) return;
+        clusterRef.current.clearLayers();
+        markersRef.current = {};
+
+        const bounds = [];
+        studies.forEach(study => {
+          const proto  = study.protocolSection || {};
+          const nctId  = proto.identificationModule?.nctId;
+          const title  = proto.identificationModule?.briefTitle || '';
+          const status = proto.statusModule?.overallStatus || 'UNKNOWN';
+          const locs   = extractLocations(study);
+
+          locs.forEach(loc => {
+            const color  = statusColor(status);
+            const marker = L.circleMarker([loc.lat, loc.lon], {
+              radius: 7, fillColor: color, color: '#fff', weight: 1.5, fillOpacity: 0.85,
+            });
+            marker.bindPopup(`
+              <div style="min-width:200px">
+                <p style="font-weight:600;font-size:13px;margin:0 0 4px">${title}</p>
+                <p style="font-size:11px;color:#6b7280;margin:0 0 4px">${nctId}</p>
+                <span style="display:inline-block;padding:1px 6px;border-radius:9999px;font-size:11px;background:${color}20;color:${color}">${formatStatus(status)}</span>
+                <p style="font-size:12px;color:#374151;margin:6px 0 0">${[loc.facility, loc.city, loc.country].filter(Boolean).join(', ')}</p>
+              </div>
+            `);
+            marker.on('click', () => onSelect(nctId));
+            clusterRef.current.addLayer(marker);
+            bounds.push([loc.lat, loc.lon]);
+
+            if (!markersRef.current[nctId]) markersRef.current[nctId] = [];
+            markersRef.current[nctId].push(marker);
+          });
+        });
+
+        if (bounds.length > 0) {
+          mapInst.current.fitBounds(bounds, { padding: [40, 40], maxZoom: 6 });
+        }
+      }, [studies]);
+
+      // Highlight selected
+      useEffect(() => {
+        Object.values(markersRef.current).flat().forEach(m => {
+          m.setStyle({ weight: 1.5, radius: 7 });
+        });
+        if (selectedId && markersRef.current[selectedId]) {
+          markersRef.current[selectedId].forEach(m => {
+            m.setStyle({ weight: 3, radius: 10 });
+            m.bringToFront();
+          });
+        }
+      }, [selectedId]);
+
+      return <div ref={mapRef} id="map" className="rounded-xl" />;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  App                                                                */
+    /* ------------------------------------------------------------------ */
+    function App() {
+      const [studies, setStudies]     = useState([]);
+      const [total, setTotal]         = useState(null);
+      const [loading, setLoading]     = useState(false);
+      const [error, setError]         = useState(null);
+      const [query, setQuery]         = useState('');
+      const [filters, setFilters]     = useState({ status: [], phase: [] });
+      const [selectedId, setSelectedId] = useState(null);
+      const [detailStudy, setDetailStudy] = useState(null);
+      const [nextToken, setNextToken] = useState(null);
+      const [loadingMore, setLoadingMore] = useState(false);
+
+      const search = useCallback(async (q, f = filters, append = false, token = null) => {
+        if (!append) { setLoading(true); setStudies([]); setTotal(null); setSelectedId(null); setDetailStudy(null); }
+        else setLoadingMore(true);
+        setError(null);
+        setQuery(q);
+
+        try {
+          const data = await fetchStudies(q, f, token);
+          const list = data.studies || [];
+          setStudies(prev => append ? [...prev, ...list] : list);
+          setTotal(data.totalCount ?? null);
+          setNextToken(data.nextPageToken || null);
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setLoading(false);
+          setLoadingMore(false);
+        }
+      }, [filters]);
+
+      // Re-search when filters change (if there's already a query)
+      useEffect(() => {
+        if (query) search(query, filters);
+      }, [filters]);
+
+      const selectedStudy = useMemo(() => {
+        if (detailStudy) return detailStudy;
+        return studies.find(s => s.protocolSection?.identificationModule?.nctId === selectedId) || null;
+      }, [selectedId, detailStudy, studies]);
+
+      const geoStudies = useMemo(() => studies.filter(s => extractLocations(s).length > 0), [studies]);
+      const geoCount   = geoStudies.reduce((n, s) => n + extractLocations(s).length, 0);
+
+      return (
+        <div className="flex flex-col h-full">
+          {/* Header */}
+          <header className="bg-white border-b border-gray-200 px-4 py-3 flex-shrink-0">
+            <div className="max-w-screen-2xl mx-auto flex flex-col sm:flex-row sm:items-center gap-3">
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center">
+                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>
+                </div>
+                <h1 className="text-lg font-bold text-gray-900">Clinical Trials Map</h1>
+              </div>
+              <div className="flex items-center gap-2 flex-1">
+                <SearchBar onSearch={q => search(q, filters)} loading={loading} />
+                <Filters filters={filters} setFilters={setFilters} />
+              </div>
+            </div>
+          </header>
+
+          {/* Body */}
+          <div className="flex-1 flex overflow-hidden">
+            {/* Sidebar */}
+            <aside className="w-96 flex-shrink-0 border-r border-gray-200 bg-white flex flex-col relative">
+              {/* Stats bar */}
+              <div className="px-4 py-2 border-b border-gray-100 text-xs text-gray-500 flex justify-between">
+                <span>{total !== null ? `${total.toLocaleString()} studies found` : 'Search to begin'}</span>
+                {geoCount > 0 && <span>{geoCount} map pins</span>}
+              </div>
+
+              {/* List */}
+              <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                {error && (
+                  <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">{error}</div>
+                )}
+
+                {loading && <SkeletonCards />}
+
+                {!loading && studies.length === 0 && !error && (
+                  <div className="flex flex-col items-center justify-center h-full text-center px-6 py-12">
+                    <svg className="w-16 h-16 text-gray-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>
+                    <p className="text-gray-500 text-sm mb-1">Search for clinical trials</p>
+                    <p className="text-gray-400 text-xs">Try "diabetes", "breast cancer", or "COVID-19"</p>
+                  </div>
+                )}
+
+                {studies.map(s => {
+                  const nctId = s.protocolSection?.identificationModule?.nctId;
+                  return (
+                    <TrialCard
+                      key={nctId}
+                      study={s}
+                      isSelected={selectedId === nctId}
+                      onClick={() => { setSelectedId(nctId); setDetailStudy(null); }}
+                    />
+                  );
+                })}
+
+                {nextToken && !loading && (
+                  <button
+                    onClick={() => search(query, filters, true, nextToken)}
+                    disabled={loadingMore}
+                    className="w-full py-2 text-sm text-brand-600 hover:bg-brand-50 rounded-lg border border-brand-200 disabled:opacity-50"
+                  >
+                    {loadingMore ? 'Loading...' : 'Load more results'}
+                  </button>
+                )}
+              </div>
+
+              {/* Detail overlay */}
+              {selectedStudy && (
+                <StudyDetail study={selectedStudy} onClose={() => { setSelectedId(null); setDetailStudy(null); }} />
+              )}
+            </aside>
+
+            {/* Map */}
+            <main className="flex-1 relative">
+              <MapView studies={geoStudies} selectedId={selectedId} onSelect={id => { setSelectedId(id); setDetailStudy(null); }} />
+
+              {/* Legend */}
+              <div className="absolute bottom-4 left-4 bg-white/95 backdrop-blur rounded-lg shadow-lg p-3 z-[500]">
+                <h4 className="text-xs font-semibold text-gray-500 mb-1.5">Status</h4>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+                  {Object.entries(STATUS_COLORS).slice(0, 6).map(([key, color]) => (
+                    <div key={key} className="flex items-center gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{background: color}}></span>
+                      <span className="text-xs text-gray-600">{STATUS_LABELS[key]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </main>
+          </div>
+        </div>
+      );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  Mount                                                              */
+    /* ------------------------------------------------------------------ */
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
